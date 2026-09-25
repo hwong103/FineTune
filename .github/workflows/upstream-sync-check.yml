@@ -261,9 +261,12 @@ jobs:
         run: |
           set -uo pipefail
 
+          # Search open AND closed. A closed digest is not returned by
+          # --state open, so without this the next non-empty week would create a
+          # duplicate issue instead of updating the existing one.
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" \
-            --state open --limit 100 --json number,title \
-            --jq '[.[] | select(.title == "Upstream PR digest")] | .[0].number // empty')
+            --state all --limit 100 --json number,title,state \
+            --jq '[.[] | select(.title == "Upstream PR digest")] | sort_by(.number) | last | .number // empty')
 
           if [ "$NEW_COUNT" = "0" ] && [ -n "$EXISTING" ]; then
             echo "No new PRs; closing digest #$EXISTING."
@@ -272,12 +275,13 @@ jobs:
           elif [ "$NEW_COUNT" != "0" ]; then
             BODY=$(cat pr-report.md)
             if [ -n "$EXISTING" ]; then
+              gh issue reopen "$EXISTING" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
               gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY" \
-                || echo "Could not update digest #$EXISTING"
+                && echo "Updated digest #$EXISTING" || echo "Could not update digest #$EXISTING"
             else
               gh issue create --repo "$GITHUB_REPOSITORY" \
                 --title "Upstream PR digest" --body "$BODY" \
-                || echo "Could not create digest"
+                && echo "Created digest" || echo "Could not create digest"
             fi
           fi
 
