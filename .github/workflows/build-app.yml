@@ -1,0 +1,72 @@
+name: Build App
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and upload app
+    runs-on: macos-26
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Stamp version
+        run: |
+          # A version above upstream 1.9.0 also stops Sparkle from ever offering
+          # an upstream downgrade over this build.
+          sed -i '' "s/MARKETING_VERSION = [^;]*/MARKETING_VERSION = 1.9.1/g" FineTune.xcodeproj/project.pbxproj
+          sed -i '' "s/CURRENT_PROJECT_VERSION = [^;]*/CURRENT_PROJECT_VERSION = 9001/g" FineTune.xcodeproj/project.pbxproj
+          grep -m2 -E "MARKETING_VERSION|CURRENT_PROJECT_VERSION" FineTune.xcodeproj/project.pbxproj
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project FineTune.xcodeproj \
+            -scheme FineTune \
+            -configuration Release \
+            -derivedDataPath build/dd \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES
+
+      - name: Re-sign with entitlements and package
+        run: |
+          APP="build/dd/Build/Products/Release/FineTune.app"
+          test -d "$APP"
+
+          # The build above runs ad-hoc unsigned for CI. Sign for real so the
+          # audio-input and Bluetooth entitlements are actually applied.
+          codesign --force --sign - --timestamp=none \
+            --entitlements FineTune/FineTune.entitlements \
+            "$APP"
+
+          codesign --verify --verbose=2 "$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | head -8
+
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$APP" dist/FineTune-1.9.1-hwong103.zip
+          ls -la dist/
+
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: FineTune-1.9.1-hwong103
+          path: dist/FineTune-1.9.1-hwong103.zip
+          retention-days: 30
+          if-no-files-found: error
