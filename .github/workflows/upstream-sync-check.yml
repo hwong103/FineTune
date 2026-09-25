@@ -84,20 +84,19 @@ jobs:
 
           cat sync-report.md
 
-      - name: Open or update tracking issue
+      - name: Report result
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
           BEHIND=${{ steps.divergence.outputs.behind }}
           UPSTREAM_SHA=${{ steps.divergence.outputs.upstream_sha }}
-          AHEAD=${{ steps.divergence.outputs.ahead }}
+          UPSTREAM_DATE=${{ steps.divergence.outputs.upstream_date }}
 
           if [ "$BEHIND" -eq 0 ]; then
-            echo "No upstream commits to sync. Closing any open tracking issue."
-            gh issue close 900 \
-              --repo "$GITHUB_REPOSITORY" \
-              --comment "Upstream is still at \`$UPSTREAM_SHA\`. Nothing to sync." \
+            echo "Upstream is still at \`$UPSTREAM_SHA\` ($UPSTREAM_DATE). Nothing to sync."
+            # Close any stale tracking issue, but never fail the run over it.
+            gh issue close 900 --repo "$GITHUB_REPOSITORY" \
+              --comment "Upstream unchanged at \`$UPSTREAM_SHA\`. Nothing to sync." \
               2>/dev/null || true
             exit 0
           fi
@@ -109,10 +108,10 @@ jobs:
             --jq '[.[] | select(.title == "Upstream sync pending")] | .[0].number // empty')
 
           if [ -n "$EXISTING" ]; then
-            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
-            echo "Updated issue #$EXISTING"
+            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY" \
+              && echo "Updated issue #$EXISTING" || echo "Could not update issue #$EXISTING"
           else
             gh issue create --repo "$GITHUB_REPOSITORY" \
-              --title "Upstream sync pending" --body "$BODY"
-            echo "Created tracking issue"
+              --title "Upstream sync pending" --body "$BODY" \
+              && echo "Created tracking issue" || echo "Could not create tracking issue"
           fi
