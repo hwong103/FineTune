@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
   issues: write
+  pull-requests: read
 
 concurrency:
   group: ${{ github.workflow }}
@@ -122,3 +123,168 @@ jobs:
               --title "Upstream sync pending" --body "$BODY" \
               && echo "Created tracking issue" || echo "Could not create tracking issue"
           fi
+
+  triage:
+    name: Triage new upstream pull requests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Collect upstream pull requests
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          gh pr list --repo ronitsingh10/FineTune \
+            --state open --limit 100 \
+            --json number,title,createdAt,updatedAt,url,files \
+            > prs.json
+
+          echo "Open upstream PRs: $(jq 'length' prs.json)"
+
+          # Remember which PRs we have already reported, so a re-run reports only
+          # what is new instead of re-raising the same 40 every week. The state
+          # file is committed to the repo (see the "Persist PR triage state"
+          # step) because Actions runners start from a clean checkout each run.
+          mkdir -p .state
+          git show HEAD:.state/reported-prs.json > seen.json 2>/dev/null || echo '[]' > seen.json
+
+          # Classify: does the PR touch audio/Bluetooth/DDC/EQ/routing, and does
+          # it collide with the files this fork has changed?
+          # NOTE: keep the classification in a separate .jq file. The nested
+          # quoting in a heredoc-free inline program is easy to get wrong, and
+          # `any(.files[]; ...)` silently yields "other" for every PR when the
+          # path objects are not unwrapped first.
+          cat > classify.jq <<'JQEOF'
+          map(
+            . as $pr
+            | ($pr.files | map(.path)) as $paths
+            | {
+                number: $pr.number,
+                title: $pr.title,
+                url: $pr.url,
+                createdAt: $pr.createdAt,
+                updatedAt: $pr.updatedAt,
+                files: $paths,
+                area: (
+                  if ($paths | any(test("Audio/"))) then "audio"
+                  elif ($paths | any(test("Bluetooth|BT"))) then "bluetooth"
+                  elif ($paths | any(test("DDC"))) then "ddc"
+                  elif ($paths | any(test("EQ|AutoEQ|Loudness"))) then "eq"
+                  elif ($paths | any(test("Views/"))) then "ui"
+                  elif ($paths | any(test("Settings/"))) then "settings"
+                  else "other"
+                  end
+                ),
+                collides: ($paths | any(
+                  . == "FineTune/Info.plist"
+                  or . == "FineTune/Views/MenuBarPopupView.swift"
+                  or . == "FineTune.xcodeproj/project.pbxproj"))
+              }
+          )
+          | { all: ., newCount: length }
+          JQEOF
+
+          jq -f classify.jq prs.json > triaged.raw.json
+
+          # Mark as new only those PR numbers absent from the recorded state, so
+          # a steady week does not re-raise the same backlog.
+          jq --slurpfile seen seen.json '
+            ($seen[0] | map(.number) | map(tostring)) as $known
+            | .all |= map(. + {
+                isNew: ((.number | tostring) as $k | ($known | index($k)) == null)
+              })
+            | .newCount = ([.all[] | select(.isNew)] | length)
+          ' triaged.raw.json > triaged.json
+
+          NEW=$(jq -r '.newCount' triaged.json)
+          TOTAL=$(jq -r '.all | length' triaged.json)
+          echo "New since last run: $NEW of $TOTAL"
+          echo "newCount=$NEW" >> "$GITHUB_OUTPUT"
+          echo "totalCount=$TOTAL" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise new pull requests
+        if: steps.collect.outputs.newCount != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Emit a report whenever the set of open PRs changed at all, so a PR
+          # that goes stale or gets closed also surfaces.
+          jq -r '
+            (.all | map(.number) | sort | join(","))
+          ' triaged.json > .state/pr-signature.txt
+
+          {
+            echo "### New upstream pull requests"
+            echo
+            echo "Upstream has not merged since 2026-07-09, so these are unmerged."
+            echo "Triage here rather than waiting on the maintainer."
+            echo
+            echo "| PR | Area | Collides with fork | Title |"
+            echo "|---|---|---|---|"
+            jq -r '
+              (.all | map(select(.isNew)) | sort_by(.number))[] 
+              | "| [#\(.number)](\(.url)) | \(.area) | \(if .collides then "yes" else "no" end) | \(.title) |"
+            ' triaged.json
+            echo
+            echo "#### All open upstream PRs by area"
+            echo
+            echo "| Area | Count |"
+            echo "|---|---|"
+            jq -r '.all | group_by(.area) | sort_by(-length)[] | "| \(.[0].area) | \(length) |"' triaged.json
+          } > pr-report.md
+
+          cat pr-report.md
+
+      - name: Open or update pull request digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_COUNT: ${{ steps.collect.outputs.newCount }}
+        run: |
+          set -uo pipefail
+
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == "Upstream PR digest")] | .[0].number // empty')
+
+          if [ "$NEW_COUNT" = "0" ] && [ -n "$EXISTING" ]; then
+            echo "No new PRs; closing digest #$EXISTING."
+            gh issue close "$EXISTING" --repo "$GITHUB_REPOSITORY" \
+              --comment "No new upstream pull requests this week." 2>/dev/null || true
+          elif [ "$NEW_COUNT" != "0" ]; then
+            BODY=$(cat pr-report.md)
+            if [ -n "$EXISTING" ]; then
+              gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY" \
+                || echo "Could not update digest #$EXISTING"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" \
+                --title "Upstream PR digest" --body "$BODY" \
+                || echo "Could not create digest"
+            fi
+          fi
+
+      - name: Persist PR triage state
+        if: steps.collect.outputs.newCount != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .state
+          jq -c '[.all[] | {number, updatedAt}]' triaged.json > .state/reported-prs.json
+          echo "Recording $(jq 'length' .state/reported-prs.json) PRs for next run."
+
+          # Commit back to main so next week's run can diff against this set.
+          # A scheduled workflow cannot push to its own triggering ref, so this
+          # uses the contents API with the default token.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .state/reported-prs.json
+          git commit -m "ci: record upstream PR triage state" || {
+            echo "Nothing to commit."
+            exit 0
+          }
+          git push origin HEAD:main
