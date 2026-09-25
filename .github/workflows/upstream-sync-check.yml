@@ -102,10 +102,17 @@ jobs:
 
           if [ "$BEHIND" -eq 0 ]; then
             echo "Upstream is still at \`$UPSTREAM_SHA\` ($UPSTREAM_DATE). Nothing to sync."
-            # Close any stale tracking issue, but never fail the run over it.
-            gh issue close 900 --repo "$GITHUB_REPOSITORY" \
-              --comment "Upstream unchanged at \`$UPSTREAM_SHA\`. Nothing to sync." \
-              2>/dev/null || true
+            # Look the issue up by title. Hardcoding a number closes the wrong
+            # issue once numbering shifts, and silently leaves stale ones open.
+            STALE=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+              --state open --limit 100 --json number,title \
+              --jq '[.[] | select(.title == "Upstream sync pending")] | .[0].number // empty')
+            if [ -n "$STALE" ]; then
+              gh issue close "$STALE" --repo "$GITHUB_REPOSITORY" \
+                --comment "Upstream unchanged at \`$UPSTREAM_SHA\`. Nothing to sync." \
+                2>/dev/null || true
+              echo "Closed stale sync issue #$STALE."
+            fi
             exit 0
           fi
 
@@ -130,6 +137,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          # Required: the state-persistence step commits .state/ back to main,
+          # which needs a real git repository.
+          fetch-depth: 0
+
       - name: Collect upstream pull requests
         id: collect
         env:
@@ -277,14 +291,16 @@ jobs:
           jq -c '[.all[] | {number, updatedAt}]' triaged.json > .state/reported-prs.json
           echo "Recording $(jq 'length' .state/reported-prs.json) PRs for next run."
 
-          # Commit back to main so next week's run can diff against this set.
-          # A scheduled workflow cannot push to its own triggering ref, so this
-          # uses the contents API with the default token.
+          # Commit back so next week's run can diff against this set. State
+          # persistence is a convenience, not correctness: a failure here must
+          # not fail the run or block the digest.
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .state/reported-prs.json
-          git commit -m "ci: record upstream PR triage state" || {
+          if git diff --cached --quiet; then
             echo "Nothing to commit."
             exit 0
-          }
-          git push origin HEAD:main
+          fi
+          git commit -m "ci: record upstream PR triage state"
+          git push origin HEAD:main \
+            || echo "Could not persist triage state; next run will re-report all open PRs."
