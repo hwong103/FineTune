@@ -30,8 +30,10 @@ jobs:
       - name: Fetch upstream main
         run: |
           git remote add upstream https://github.com/ronitsingh10/FineTune.git
+          # actions/checkout leaves origin/main at the triggering commit, which
+          # may lag the branch head and makes the "behind" count meaningless.
+          git fetch --no-tags origin main:refs/remotes/origin/main
           git fetch --no-tags upstream main
-          git fetch --no-tags origin main
 
       - name: Report divergence
         id: divergence
@@ -67,9 +69,9 @@ jobs:
               echo '```'
             fi
             echo
-            echo "Files we have changed relative to upstream (merge-conflict surface):"
+            echo "Our changes relative to upstream (merge-conflict surface):"
             echo '```'
-            git diff --stat origin/main...upstream/main -- FineTune/ || true
+            git diff --stat upstream/main...origin/main -- FineTune/ || true
             echo '```'
             echo
             echo "To sync, work on a scratch branch rather than merging into \`main\` directly:"
