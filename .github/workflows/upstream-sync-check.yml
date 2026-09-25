@@ -1,0 +1,118 @@
+name: Upstream Sync Check
+
+# Upstream FineTune has been dormant (no merge to main since 2026-07-09), so
+# this is a cheap heads-up, not an automated merge. It opens or updates a single
+# tracking issue rather than touching the working tree, and never auto-merges.
+on:
+  schedule:
+    # Weekly, Monday 09:00 Sydney time. GitHub cron is always UTC.
+    - cron: '0 23 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Compare fork against upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/ronitsingh10/FineTune.git
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main
+
+      - name: Report divergence
+        id: divergence
+        run: |
+          set -euo pipefail
+
+          AHEAD=$(git rev-list --count upstream/main..origin/main)
+          BEHIND=$(git rev-list --count origin/main..upstream/main)
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          UPSTREAM_DATE=$(git log -1 --date=short --pretty=%ad upstream/main)
+
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_date=$UPSTREAM_DATE" >> "$GITHUB_OUTPUT"
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Upstream sync check"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream \`main\` | \`$UPSTREAM_SHA\` ($UPSTREAM_DATE) |"
+            echo "| Fork-only commits | $AHEAD |"
+            echo "| Upstream commits we lack | $BEHIND |"
+            echo
+            if [ "$BEHIND" -eq 0 ]; then
+              echo "Upstream has not moved past the point we forked from. Nothing to sync."
+            else
+              echo "Upstream has new commits. Review before merging:"
+              echo
+              echo '```'
+              git log --oneline origin/main..upstream/main
+              echo '```'
+            fi
+            echo
+            echo "Files we have changed relative to upstream (merge-conflict surface):"
+            echo '```'
+            git diff --stat origin/main...upstream/main -- FineTune/ || true
+            echo '```'
+            echo
+            echo "To sync, work on a scratch branch rather than merging into \`main\` directly:"
+            echo
+            echo '```'
+            echo "git fetch upstream main"
+            echo "git switch -c sync/upstream main"
+            echo "git rebase upstream/main   # or: git merge upstream/main"
+            echo "git push origin sync/upstream"
+            echo '```'
+          } > sync-report.md
+
+          cat sync-report.md
+
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BEHIND=${{ steps.divergence.outputs.behind }}
+          UPSTREAM_SHA=${{ steps.divergence.outputs.upstream_sha }}
+          AHEAD=${{ steps.divergence.outputs.ahead }}
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "No upstream commits to sync. Closing any open tracking issue."
+            gh issue close 900 \
+              --repo "$GITHUB_REPOSITORY" \
+              --comment "Upstream is still at \`$UPSTREAM_SHA\`. Nothing to sync." \
+              2>/dev/null || true
+            exit 0
+          fi
+
+          BODY=$(cat sync-report.md)
+
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+            --state open --limit 100 --json number,title \
+            --jq '[.[] | select(.title == "Upstream sync pending")] | .[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "Updated issue #$EXISTING"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Upstream sync pending" --body "$BODY"
+            echo "Created tracking issue"
+          fi
