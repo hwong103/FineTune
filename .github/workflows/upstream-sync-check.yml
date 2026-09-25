@@ -26,6 +26,11 @@ jobs:
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
+        with:
+          # The default depth-1 clone hides ancestry, so rev-list counts every
+          # upstream commit as missing (reported 660 behind / 1 ahead instead of
+          # the true 0 / 6). Full history is required for a correct comparison.
+          fetch-depth: 0
 
       - name: Fetch upstream main
         run: |
