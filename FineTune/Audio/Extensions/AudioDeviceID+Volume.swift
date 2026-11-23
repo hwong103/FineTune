@@ -101,43 +101,95 @@ extension AudioDeviceID {
 
 // MARK: - Device Mute
 
+protocol AudioDeviceMuteAccessing {
+    func outputChannelCount(for device: AudioDeviceID) -> Int
+    func readMute(for device: AudioDeviceID, element: AudioObjectPropertyElement) -> Bool?
+    func writeMute(_ muted: Bool, for device: AudioDeviceID, element: AudioObjectPropertyElement) -> Bool
+}
+
+struct CoreAudioDeviceMuteAccessor: AudioDeviceMuteAccessing {
+    func outputChannelCount(for device: AudioDeviceID) -> Int {
+        device.outputChannelCount()
+    }
+
+    func readMute(for device: AudioDeviceID, element: AudioObjectPropertyElement) -> Bool? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+
+        guard AudioObjectHasProperty(device, &address) else { return nil }
+
+        var muted: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        let err = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &muted)
+        return err == noErr ? muted != 0 : nil
+    }
+
+    func writeMute(_ muted: Bool, for device: AudioDeviceID, element: AudioObjectPropertyElement) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: element
+        )
+
+        guard AudioObjectHasProperty(device, &address) else { return false }
+
+        var value: UInt32 = muted ? 1 : 0
+        let size = UInt32(MemoryLayout<UInt32>.size)
+        let err = AudioObjectSetPropertyData(device, &address, 0, nil, size, &value)
+        return err == noErr
+    }
+}
+
 extension AudioDeviceID {
     /// Reads the mute state for the device.
     /// Returns true if muted, false if unmuted or if mute is not supported.
     func readMuteState() -> Bool {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyMute,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
+        readMuteState(using: CoreAudioDeviceMuteAccessor())
+    }
 
-        guard AudioObjectHasProperty(self, &address) else {
-            return false
+    func readMuteState(using accessor: any AudioDeviceMuteAccessing) -> Bool {
+        if let mainMute = accessor.readMute(for: self, element: kAudioObjectPropertyElementMain) {
+            return mainMute
         }
 
-        var muted: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        let err = AudioObjectGetPropertyData(self, &address, 0, nil, &size, &muted)
-        return err == noErr && muted != 0
+        let channelCount = accessor.outputChannelCount(for: self)
+        guard channelCount > 0 else { return false }
+
+        let channelMutes = (1...channelCount).compactMap {
+            accessor.readMute(for: self, element: AudioObjectPropertyElement($0))
+        }
+        // Expose a partially muted device as muted so one toggle restores every channel.
+        return channelMutes.contains(true)
     }
 
     /// Sets the mute state for the device.
     /// Returns true if successful, false otherwise.
     func setMuteState(_ muted: Bool) -> Bool {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyMute,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
+        setMuteState(muted, using: CoreAudioDeviceMuteAccessor())
+    }
 
-        guard AudioObjectHasProperty(self, &address) else {
-            return false
+    func setMuteState(_ muted: Bool, using accessor: any AudioDeviceMuteAccessing) -> Bool {
+        if accessor.writeMute(muted, for: self, element: kAudioObjectPropertyElementMain) {
+            return true
         }
 
-        var value: UInt32 = muted ? 1 : 0
-        let size = UInt32(MemoryLayout<UInt32>.size)
-        let err = AudioObjectSetPropertyData(self, &address, 0, nil, size, &value)
-        return err == noErr
+        let channelCount = accessor.outputChannelCount(for: self)
+        guard channelCount > 0 else { return false }
+
+        var supportedChannelCount = 0
+        var allWritesSucceeded = true
+        for channel in 1...channelCount {
+            let element = AudioObjectPropertyElement(channel)
+            guard accessor.readMute(for: self, element: element) != nil else { continue }
+            supportedChannelCount += 1
+            if !accessor.writeMute(muted, for: self, element: element) {
+                allWritesSucceeded = false
+            }
+        }
+        return supportedChannelCount > 0 && allWritesSucceeded
     }
 }
 
